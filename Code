@@ -1,0 +1,179 @@
+function AD-HRCompare
+ { 
+  param([string]$HRexport, [string]$exportfile)
+
+
+
+#Rename file to be in the format Departments&JobTitles-yy.mm.dd
+$FilePath = $HRexport
+$CompareFilePath = $exportfile
+
+
+#if run multiple times it will remove the old file
+Remove-Item -Path $CompareFilePath -ErrorAction SilentlyContinue
+
+
+$ColorKey = ConvertFrom-Csv @"
+Color, Meaning
+Pink, Different Job Titles
+Gold, Different Department
+Green, Both Different
+"@
+
+
+#UserList is the data from HR excel sheet
+$UserList = import-excel -path $FilePath
+
+
+
+#fill an array with data from Active Directory and combine it with the data from UserList from HR
+$AD_HR_UserList = @()
+
+foreach ($user in $UserList){
+    $AssociateID = $user.'Associate ID'
+    $AdUser = get-admuser -Filter {EmployeeNumber -eq $AssociateID} -Properties EmployeeNumber, Description, Department
+    if (!($AdUser.name -like "")){
+        $object = New-Object psobject -Property @{
+            Name = $AdUser.Name
+            LoginName = $AdUser.SamAccountName
+            HrJobTitle = $user.'Job Title Description'
+            AdJobTitle = $AdUser.Description
+            HrDepartment = $user.'Home Department Description'
+            AdDepartment = $AdUser.Department
+        }
+    }
+    $AD_HR_UserList += $Object
+}
+
+
+
+
+#Sort the data
+$AD_HR_UserList = $AD_HR_UserList | Select Name, LoginName, HrJobTitle, AdJobTitle, HrDepartment, AdDepartment | Sort -Property Name 
+
+$totalRows = 
+
+$NamesNeedFixing = @()
+$NamesNeedFixingBoth = @()
+$NamesNeedFixingJobTitle = @()
+$NamesNeedFixingDepartment = @()
+
+#for AD_HR_UserList fill lists with users that have both wrong, just job title wrong, or just department wrong
+foreach ($user in $AD_HR_UserList){
+
+    #In ADP there is a character limit so they use "&" instead of "and"
+    $HrJobTitle = ($user.HrJobTitle -replace "Branch","" -replace "&", "and").trim()
+    $AdJobTitle = ($user.AdJobTitle -replace "Branch","" -replace "&", "and").trim()
+    $HrDepartment = ($user.HrDepartment -replace "Branch","" -replace "&", "and").trim()
+    $AdDepartment = ($user.AdDepartment -replace "Branch","" -replace "&", "and").trim()
+
+    if(!($HrJobTitle -eq $AdJobTitle) -and !($HrDepartment -eq $AdDepartment)){
+         $Object = New-Object psobject -Property @{
+            Name = $user.Name
+            LoginName = $user.LoginName
+            HrJobTitle = $user.HrJobTitle
+            AdJobTitle = $user.AdJobTitle
+            HrDepartment = $user.HrDepartment
+            AdDepartment = $user.AdDepartment
+        }
+        $NamesNeedFixingBoth += $Object
+    }
+
+    if(!($HrJobTitle -eq $AdJobTitle)){
+        if(!($NamesNeedFixingBoth.LoginName.Contains($user.LoginName))){
+            $JobTitleObject = New-Object psobject -Property @{
+                Name = $user.Name
+                LoginName = $user.LoginName
+                HrJobTitle = $user.HrJobTitle
+                AdJobTitle = $user.AdJobTitle
+            }
+            $NamesNeedFixingJobTitle += $JobTitleObject
+        }
+    }
+
+    
+    if(!($HrDepartment -eq $AdDepartment)){
+        if(!($NamesNeedFixingBoth.LoginName.Contains($user.LoginName))){
+            $DepartmentObject = New-Object psobject -Property @{
+                Name = $user.Name
+                LoginName = $user.LoginName
+                HrDepartment = $user.HrDepartment
+                AdDepartment = $user.AdDepartment
+            }
+            $NamesNeedFixingDepartment += $DepartmentObject
+        }
+    }
+}
+
+
+$ct = @()
+$columnValue = '$B1'
+
+# for each person in each of those lists, add a condition value that is their login name. Add that condition value to the ct list
+foreach($user in $NamesNeedFixingBoth){
+    $name = """$($user.loginname)"""
+    $ct += New-ConditionalText -ConditionalType Expression -Conditionvalue "=$columnvalue=$($name)" -BackgroundColor LightGreen -ConditionalTextColor Black -Range "A:F"
+}
+
+foreach($user in $NamesNeedFixingJobTitle){
+    $name = """$($user.loginname)"""
+    $ct += New-ConditionalText -ConditionalType Expression -Conditionvalue "=$columnvalue=$($name)" -BackgroundColor Pink -ConditionalTextColor Black -Range "A:D"
+}
+
+foreach($user in $NamesNeedFixingDepartment){
+    $name = """$($user.loginname)"""
+    $ct += New-ConditionalText -ConditionalType Expression -Conditionvalue "=$columnvalue=$($name)" -BackgroundColor Gold -ConditionalTextColor Black -Range "A:B,E:F"
+}
+
+#combine all the wrong ones into one list
+$NamesNeedFixing = $NamesNeedFixingBoth + $NamesNeedFixingJobTitle + $NamesNeedFixingDepartment | Select Name,  LoginName, HrJobTitle, AdJobTitle, HrDepartment, AdDepartment | sort -property Name
+
+
+#export the combined user list as an excel table freezing the top 6 rows with the conditional text from the ct list
+Export-Excel -InputObject $AD_HR_UserList -TableName Compare -Path $CompareFilePath -WorksheetName Compare -FreezePane 7 -AutoSize -ConditionalText $ct -StartRow 6
+
+#export the color key
+Export-Excel -InputObject $ColorKey -Path $CompareFilePath -WorksheetName Compare -StartRow 1 -BoldTopRow
+
+#open worksheet
+$p = Open-ExcelPackage -path $CompareFilePath
+
+$ws = $p.Workbook.WorkSheets[1]
+
+
+#For Color key
+Add-ConditionalFormatting -BackgroundColor Gold -RuleType Equal -ConditionValue 'Gold' -Worksheet $ws -Address "A1:B5"
+Add-ConditionalFormatting -BackgroundColor LightGreen -RuleType Equal -ConditionValue 'Green' -Worksheet $ws -Address "A1:B5"
+Add-ConditionalFormatting -BackgroundColor Pink -RuleType Equal -ConditionValue 'Pink' -Worksheet $ws -Address "A1:B5"
+
+Close-ExcelPackage $p
+
+
+#this is for everthing on the second worksheet. Making counts and percentages of how many are wrong
+$BothCount = $NamesNeedFixingBoth.count
+$JobTitleCount = $NamesNeedFixingJobTitle.count
+$DepartmentCount = $NamesNeedFixingDepartment.count
+$AllCount = $AD_HR_UserList.count
+$WrongCount = $NamesNeedFixing.count
+
+$WrongPercent = $WrongCount/$AllCount
+$BothPercent = $BothCount/$AllCount
+$JobTitlePercent = $JobTitleCount/$AllCount
+$DepartmentPercent = $DepartmentCount/$AllCount
+
+$sums = ConvertFrom-Csv @"
+Wrong, Count, Percent
+All, $WrongCount, $WrongPercent
+Both, $BothCount, $BothPercent
+Department, $DepartmentCount, $JobTitlePercent
+Job Title, $JobTitleCount, $DepartmentPercent
+"@
+
+$chart = New-ExcelChartDefinition -XRange Wrong -YRange Percent -Title "Percent Wrong" -ChartType ColumnClustered -NoLegend -YMaxValue 1
+
+Export-Excel -inputobject $sums -path $CompareFilePath -TableName Percents -WorksheetName Percents -AutoNameRange -AutoSize -ExcelChartDefinition $chart -Show
+
+write-host "Excel file exported to " $CompareFilePath -ForegroundColor DarkBlue -BackgroundColor Yellow
+
+
+}
